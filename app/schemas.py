@@ -1,0 +1,787 @@
+from datetime import date, datetime
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
+
+from app.models import ChatType, Priority, ProjectStatus, TaskStatus, WorkspaceRole
+
+
+class ORMModel(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+
+class UserRegister(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
+    organization_mode: Literal["create", "join"] | None = None
+    organization_name: str | None = Field(default=None, min_length=2, max_length=180)
+    organization_id: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_organization_choice(self):
+        if self.organization_mode == "create" and not (self.organization_name or "").strip():
+            raise ValueError("Enter an organization name")
+        if self.organization_mode == "join" and self.organization_id is None:
+            raise ValueError("Select an existing organization")
+        return self
+
+
+class OrganizationRead(ORMModel):
+    id: int
+    name: str
+    slug: str
+
+
+class OrganizationUpdate(BaseModel):
+    name: str = Field(min_length=2, max_length=180)
+
+
+class UserRead(ORMModel):
+    id: int
+    name: str
+    email: EmailStr
+    is_active: bool
+    is_system_admin: bool = False
+    is_member: bool = False
+    organization_id: int
+    organization_name: str
+    profile_image: str | None = None
+    created_at: datetime
+
+
+class UserProfileUpdate(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    profile_image: str | None = Field(default=None, max_length=3_000_000)
+    phone: str | None = Field(default=None, max_length=40)
+    location: str | None = Field(default=None, max_length=150)
+    location_city: str | None = Field(default=None, max_length=80)
+    location_state: str | None = Field(default=None, max_length=80)
+    location_country: str | None = Field(default=None, max_length=80)
+    bio: str | None = Field(default=None, max_length=300)
+    professional_title: str | None = Field(default=None, max_length=150)
+    department: str | None = Field(default=None, max_length=150)
+    years_experience: int | None = Field(default=None, ge=0, le=80)
+    experience_start_date: date | None = None
+    skills: str | None = Field(default=None, max_length=3000)
+    achievements: str | None = Field(default=None, max_length=5000)
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        digits = "".join(character for character in value if character.isdigit())
+        if len(digits) != 10:
+            raise ValueError("Phone number must contain exactly 10 digits")
+        return digits
+
+    @field_validator("achievements")
+    @classmethod
+    def normalize_achievements(cls, value: str | None) -> str | None:
+        if not value:
+            return None
+        seen: set[str] = set()
+        items: list[str] = []
+        for raw in value.replace("\n", ",").split(","):
+            item = " ".join(raw.strip().split())
+            key = item.casefold()
+            if item and key not in seen:
+                seen.add(key)
+                items.append(item)
+        return ", ".join(items) or None
+
+    @model_validator(mode="after")
+    def validate_structured_profile(self):
+        if self.experience_start_date and self.experience_start_date > date.today():
+            raise ValueError("Experience start date cannot be in the future")
+        return self
+
+
+class UserProfileRead(UserProfileUpdate):
+    email: EmailStr
+    project_count: int = 0
+    projects: list[str] = Field(default_factory=list)
+    completion_percent: int = 0
+    missing_fields: list[str] = Field(default_factory=list)
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class WorkspaceCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=150)
+    description: str | None = None
+
+
+class WorkspaceUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=2, max_length=150)
+    description: str | None = None
+
+
+class WorkspaceDeleteConfirm(BaseModel):
+    workspace_name: str = Field(min_length=2, max_length=150)
+
+
+class WorkspaceRead(ORMModel):
+    id: int
+    name: str
+    description: str | None
+    owner_id: int
+    role: WorkspaceRole | None = None
+    created_at: datetime
+
+
+class NotificationRead(ORMModel):
+    id: str
+    workspace_id: int | None = None
+    project_id: int | None = None
+    task_id: int | None = None
+    conversation_id: int | None = None
+    kind: str
+    severity: str
+    title: str
+    message: str
+    is_read: bool
+    is_acknowledged: bool
+    is_resolved: bool
+    created_at: datetime
+    updated_at: datetime
+    reminder_due: bool = False
+
+
+class NotificationList(BaseModel):
+    """Combined notification feed and badge counters for one user."""
+
+    items: list[NotificationRead]
+    unread_count: int
+    critical_count: int
+    chat_unread_count: int = 0
+
+
+class ProfileReminderSend(BaseModel):
+    user_ids: list[int] = Field(min_length=1, max_length=100)
+    title: str | None = Field(default=None, min_length=2, max_length=220)
+    message: str | None = Field(default=None, min_length=2, max_length=3000)
+
+
+class ProfileReminderResult(BaseModel):
+    sent_count: int
+
+
+class GlobalAnnouncementSend(BaseModel):
+    audience: str = Field(pattern="^(all|selected)$")
+    user_ids: list[int] = Field(default_factory=list, max_length=500)
+    title: str = Field(min_length=2, max_length=220)
+    message: str = Field(min_length=2, max_length=5000)
+
+    @model_validator(mode="after")
+    def validate_recipients(self):
+        if self.audience == "selected" and not self.user_ids:
+            raise ValueError("Select at least one recipient")
+        return self
+
+
+class NotificationReadAllResult(BaseModel):
+    marked_count: int
+
+
+class NotificationReminderSeen(BaseModel):
+    notification_ids: list[str] = Field(min_length=1, max_length=50)
+
+
+class ChatUserRead(BaseModel):
+    id: int
+    name: str
+    email: str
+    profile_image: str | None = None
+
+
+class ChatConversationCreate(BaseModel):
+    chat_type: ChatType
+    name: str | None = Field(default=None, max_length=180)
+    project_id: int | None = None
+    team_id: int | None = None
+    recipient_id: int | None = None
+
+
+class ChatMessageCreate(BaseModel):
+    body: str = Field(min_length=1, max_length=5000)
+
+
+class ChatMessageRead(BaseModel):
+    id: int
+    conversation_id: int
+    sender: ChatUserRead
+    body: str
+    is_deleted: bool = False
+    deleted_by_id: int | None = None
+    created_at: datetime
+
+
+class ChatConversationRead(BaseModel):
+    id: int
+    workspace_id: int | None = None
+    scope_type: str = "workspace"
+    chat_type: ChatType
+    name: str
+    project_id: int | None
+    team_id: int | None
+    participants: list[ChatUserRead]
+    last_message: ChatMessageRead | None
+    unread_count: int
+    can_send: bool
+    can_clear: bool = False
+
+
+class ChatScopeRead(BaseModel):
+    id: int
+    name: str
+
+
+class ChatOptionsRead(BaseModel):
+    recipients: list[ChatUserRead]
+    projects: list[ChatScopeRead]
+    teams: list[ChatScopeRead]
+    can_broadcast: bool
+
+
+class MemberAdd(BaseModel):
+    email: EmailStr
+    role: WorkspaceRole = WorkspaceRole.member
+
+
+class GlobalMemberAssign(BaseModel):
+    department: str = Field(min_length=2, max_length=120)
+    professional_title: str = Field(min_length=2, max_length=120)
+    role: WorkspaceRole = WorkspaceRole.member
+
+
+class MemberRead(ORMModel):
+    id: int
+    workspace_id: int
+    user_id: int
+    role: WorkspaceRole
+    is_active: bool
+    user: UserRead
+    professional_title: str | None = None
+    department: str | None = None
+
+
+class MemberProfessionalUpdate(BaseModel):
+    professional_title: str | None = Field(default=None, max_length=150)
+    department: str | None = Field(default=None, max_length=150)
+
+
+class MemberAccessUpdate(BaseModel):
+    is_active: bool | None = None
+    role: WorkspaceRole | None = None
+
+
+class UserDirectoryRead(BaseModel):
+    user_id: int
+    name: str
+    email: EmailStr
+    is_active: bool
+    is_member: bool = False
+    is_system_admin: bool = False
+    membership_id: int | None = None
+    membership_is_active: bool | None = None
+    role: WorkspaceRole | None = None
+    professional_title: str | None = None
+    department: str | None = None
+    profile_image: str | None = None
+    projects: list[str] = Field(default_factory=list)
+    completion_percent: int = 0
+    missing_fields: list[str] = Field(default_factory=list)
+
+
+class SkillMemberRead(BaseModel):
+    user_id: int
+    name: str
+    email: EmailStr
+    professional_title: str | None = None
+    department: str | None = None
+    profile_image: str | None = None
+    skills: list[str] = Field(default_factory=list)
+    project_ids: list[int] = Field(default_factory=list)
+    team_id: int | None = None
+    team_name: str | None = None
+    completion_percent: int = 0
+    total_active_tasks: int = 0
+    hourly_rate: int = 0
+    is_eligible: bool = False
+    eligibility_reason: str | None = None
+
+
+class GlobalSkillCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    description: str | None = Field(default=None, max_length=1000)
+
+
+class GlobalSkillUpdate(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    description: str | None = Field(default=None, max_length=1000)
+
+
+class GlobalSkillRead(ORMModel):
+    id: int
+    name: str
+    description: str | None = None
+    usage_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+
+class DesignationCreate(BaseModel):
+    department_id: int
+    name: str = Field(min_length=2, max_length=120)
+    description: str | None = Field(default=None, max_length=1000)
+    hourly_rate: int = Field(default=0, ge=0, le=1000000)
+
+
+class DesignationUpdate(BaseModel):
+    department_id: int | None = None
+    name: str | None = Field(default=None, min_length=2, max_length=120)
+    description: str | None = Field(default=None, max_length=1000)
+    hourly_rate: int | None = Field(default=None, ge=0, le=1000000)
+
+
+class DesignationRead(ORMModel):
+    id: int
+    workspace_id: int | None = None
+    name: str
+    description: str | None
+    hourly_rate: int = 0
+    department_id: int | None = None
+    department_name: str | None = None
+    created_at: datetime
+
+
+class DepartmentCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    description: str | None = Field(default=None, max_length=1000)
+
+
+class DepartmentUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=2, max_length=120)
+    description: str | None = Field(default=None, max_length=1000)
+
+
+class DepartmentRead(ORMModel):
+    id: int
+    workspace_id: int | None = None
+    name: str
+    description: str | None
+    created_at: datetime
+
+
+class HolidayCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=150)
+    holiday_date: date
+    description: str | None = Field(default=None, max_length=1000)
+
+
+class HolidayRead(ORMModel):
+    id: int
+    name: str
+    holiday_date: date
+    description: str | None = None
+    is_active: bool
+
+
+class TeamCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=150)
+    description: str | None = None
+    manager_user_id: int
+    manager_designation: str | None = Field(default=None, min_length=2, max_length=120)
+
+
+class TeamUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=2, max_length=150)
+    description: str | None = None
+    manager_user_id: int | None = None
+    manager_designation: str | None = Field(default=None, min_length=2, max_length=120)
+
+
+class TeamRead(ORMModel):
+    id: int
+    workspace_id: int | None = None
+    name: str
+    description: str | None
+    manager_user_id: int | None = None
+    manager_designation: str | None = None
+    manager_user: UserRead | None = None
+    created_at: datetime
+
+
+class TeamMemberAdd(BaseModel):
+    user_id: int
+    project_id: int
+    designation: str = Field(min_length=2, max_length=120)
+    allocation_percent: int = Field(default=100, ge=1, le=100)
+    weekly_capacity_hours: int = Field(default=40, ge=1, le=168)
+
+
+class TeamMemberUpdate(BaseModel):
+    project_id: int
+    designation: str = Field(min_length=2, max_length=120)
+    allocation_percent: int = Field(default=100, ge=1, le=100)
+    weekly_capacity_hours: int = Field(default=40, ge=1, le=168)
+
+
+class TeamMemberRead(ORMModel):
+    id: int
+    team_id: int
+    user_id: int
+    project_id: int
+    designation: str
+    allocation_percent: int = 100
+    weekly_capacity_hours: int = 40
+    user: UserRead
+    project: "ProjectRead"
+
+
+class GlobalTeamMemberAdd(BaseModel):
+    user_id: int
+
+
+class GlobalTeamMemberRead(ORMModel):
+    id: int
+    team_id: int
+    user_id: int
+    designation: str
+    user: UserRead
+
+
+class DateRangeModel(BaseModel):
+    start_date: date | None = None
+    end_date: date | None = None
+
+    @model_validator(mode="after")
+    def validate_dates(self):
+        if self.start_date and self.end_date and self.end_date < self.start_date:
+            raise ValueError("end_date must be on or after start_date")
+        return self
+
+
+class ProjectCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=180)
+    description: str | None = None
+    status: ProjectStatus = ProjectStatus.planned
+    priority: Priority = Priority.medium
+    budget: int | None = Field(default=None, ge=0)
+    contingency_percent: int = Field(default=15, ge=0, le=50)
+    deadline: date | None = None
+    start_date: date
+    end_date: date
+    project_manager_id: int | None = None
+
+    @model_validator(mode="after")
+    def validate_project_dates(self):
+        if self.end_date < self.start_date:
+            raise ValueError("end_date must be on or after start_date")
+        return self
+
+
+class ProjectUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=2, max_length=180)
+    description: str | None = None
+    status: ProjectStatus | None = None
+    priority: Priority | None = None
+    budget: int | None = Field(default=None, ge=0)
+    contingency_percent: int | None = Field(default=None, ge=0, le=50)
+    deadline: date | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    project_manager_id: int | None = None
+
+
+class ProjectRead(ORMModel):
+    id: int
+    workspace_id: int
+    name: str
+    description: str | None
+    status: ProjectStatus
+    priority: Priority
+    budget: int | None
+    contingency_percent: int = 15
+    deadline: date | None
+    start_date: date
+    end_date: date
+    project_manager_id: int | None
+    created_at: datetime
+
+
+class SprintCreate(DateRangeModel):
+    name: str = Field(min_length=2, max_length=150)
+    goal: str | None = None
+    is_active: bool = False
+
+
+class SprintRead(ORMModel):
+    id: int
+    project_id: int
+    name: str
+    goal: str | None
+    start_date: date | None
+    end_date: date | None
+    is_active: bool
+    created_at: datetime
+
+
+class SprintUpdate(DateRangeModel):
+    name: str | None = Field(default=None, min_length=2, max_length=150)
+    goal: str | None = None
+    is_active: bool | None = None
+
+
+class TaskAssignmentInput(BaseModel):
+    user_id: int
+    team_id: int
+    responsibility: str | None = Field(default=None, max_length=500)
+    planned_hours: int | None = Field(default=None, ge=0, le=5000)
+
+
+class TaskAssignmentRead(ORMModel):
+    user_id: int
+    team_id: int | None = None
+    responsibility: str | None = None
+    planned_hours: int | None = None
+
+
+class TaskCreate(BaseModel):
+    title: str = Field(min_length=2, max_length=220)
+    description: str | None = None
+    sprint_id: int | None = None
+    priority: Priority = Priority.medium
+    status: TaskStatus = TaskStatus.backlog
+    assignee_id: int | None = None
+    assignee_ids: list[int] = Field(default_factory=list)
+    assignments: list[TaskAssignmentInput] = Field(default_factory=list, max_length=100)
+    checklist: list[str] = Field(default_factory=list, max_length=50)
+    story_points: int | None = Field(default=None, ge=0, le=100)
+    estimated_hours: int | None = Field(default=None, ge=0, le=5000)
+    estimated_days: int | None = Field(default=None, ge=0, le=1000)
+    planned_budget: int | None = Field(default=None, ge=0)
+    actual_cost: int | None = Field(default=None, ge=0)
+    start_date: date | None = None
+    due_date: date | None = None
+    progress: int = Field(default=0, ge=0, le=100)
+    start_at: datetime | None = None
+    end_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_dates(self):
+        if self.start_date and self.due_date and self.due_date < self.start_date:
+            raise ValueError("due_date must be on or after start_date")
+        if self.start_at and self.end_at and self.end_at < self.start_at:
+            raise ValueError("end_at must be on or after start_at")
+        return self
+
+
+class TaskUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=2, max_length=220)
+    description: str | None = None
+    sprint_id: int | None = None
+    priority: Priority | None = None
+    status: TaskStatus | None = None
+    assignee_id: int | None = None
+    assignee_ids: list[int] | None = None
+    assignments: list[TaskAssignmentInput] | None = None
+    story_points: int | None = Field(default=None, ge=0, le=100)
+    estimated_hours: int | None = Field(default=None, ge=0, le=5000)
+    estimated_days: int | None = Field(default=None, ge=0, le=1000)
+    planned_budget: int | None = Field(default=None, ge=0)
+    actual_cost: int | None = Field(default=None, ge=0)
+    start_date: date | None = None
+    due_date: date | None = None
+    progress: int | None = Field(default=None, ge=0, le=100)
+    start_at: datetime | None = None
+    end_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_dates(self):
+        if self.start_date and self.due_date and self.due_date < self.start_date:
+            raise ValueError("due_date must be on or after start_date")
+        if self.start_at and self.end_at and self.end_at < self.start_at:
+            raise ValueError("end_at must be on or after start_at")
+        return self
+
+
+class TaskCompletionUpdate(BaseModel):
+    is_completed: bool
+
+
+class TaskRead(ORMModel):
+    id: int
+    project_id: int
+    sprint_id: int | None
+    title: str
+    description: str | None
+    priority: Priority
+    status: TaskStatus
+    assignee_id: int | None
+    assignee_ids: list[int] = Field(default_factory=list)
+    assignments: list[TaskAssignmentRead] = Field(default_factory=list)
+    reporter_id: int
+    story_points: int | None
+    estimated_hours: int | None = None
+    estimated_days: int | None = None
+    planned_budget: int | None = None
+    actual_cost: int | None = None
+    start_date: date | None
+    due_date: date | None
+    progress: int
+    start_at: datetime | None = None
+    end_at: datetime | None = None
+    checklist_total: int = 0
+    checklist_done: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+
+class AITaskPlanRequest(BaseModel):
+    prompt: str = Field(min_length=10, max_length=4000)
+    maximum_tasks: int = Field(default=20, ge=1, le=20)
+    team_ids: list[int] = Field(default_factory=list, max_length=50)
+    # Retained for compatibility with older API clients.
+    team_id: int | None = None
+
+
+class AIGeneratedTask(BaseModel):
+    title: str = Field(min_length=2, max_length=220)
+    description: str | None = Field(default=None, max_length=3000)
+    priority: Priority = Priority.medium
+    story_points: int | None = Field(default=None, ge=0, le=100)
+    estimated_hours: int | None = Field(default=None, ge=0, le=5000)
+    estimated_days: int | None = Field(default=None, ge=0, le=1000)
+    planned_budget: int | None = Field(default=None, ge=0)
+    team_ids: list[int] = Field(default_factory=list, max_length=50)
+    assignee_ids: list[int] = Field(default_factory=list)
+    assignments: list[TaskAssignmentInput] = Field(default_factory=list, max_length=100)
+    start_date: date | None = None
+    end_date: date | None = None
+    checklist: list[str] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def validate_generated_dates(self):
+        if self.start_date and self.end_date and self.end_date < self.start_date:
+            raise ValueError("end_date must be on or after start_date")
+        self.checklist = list(dict.fromkeys(
+            item.strip() for item in self.checklist if item.strip()
+        ))
+        return self
+
+
+class AIGeneratedPlan(BaseModel):
+    summary: str = Field(min_length=2, max_length=500)
+    tasks: list[AIGeneratedTask] = Field(min_length=1, max_length=50)
+
+
+class AITaskPlanResponse(AIGeneratedPlan):
+    provider: str
+    model: str
+    fallback_used: bool = False
+
+
+class AITaskPlanConfirm(BaseModel):
+    tasks: list[AIGeneratedTask] = Field(min_length=1, max_length=50)
+
+
+class CommentCreate(BaseModel):
+    body: str = Field(min_length=1, max_length=5000)
+
+
+class CommentRead(ORMModel):
+    id: int
+    task_id: int
+    author_id: int
+    body: str
+    created_at: datetime
+
+
+class ChecklistItemCreate(BaseModel):
+    text: str = Field(min_length=1, max_length=500)
+
+
+class ChecklistItemUpdate(BaseModel):
+    text: str | None = Field(default=None, min_length=1, max_length=500)
+    is_done: bool | None = None
+    position: int | None = Field(default=None, ge=0)
+
+
+class ChecklistItemRead(ORMModel):
+    id: int
+    task_id: int
+    text: str
+    is_done: bool
+    position: int
+    created_by_id: int | None = None
+    last_action_by_id: int | None = None
+    last_action: str | None = None
+    created_at: datetime
+
+
+class DashboardSummary(BaseModel):
+    projects: int
+    active_projects: int
+    tasks: int
+    completed_tasks: int
+    overdue_tasks: int
+    completion_percent: float
+
+
+class WorkspaceOverviewRead(BaseModel):
+    projects: list[ProjectRead]
+    dashboard: DashboardSummary
+
+
+class BoardSetup(BaseModel):
+    framework: str = Field(pattern="^(scrum|kanban)$")
+    reset: bool = False
+
+
+class BoardColumnCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    color: str = Field(default="#8b97ac", pattern=r"^#[0-9a-fA-F]{6}$")
+    system_status: str | None = Field(
+        default=None,
+        pattern="^(backlog|todo|in_progress|review|testing|done)$",
+    )
+
+
+class BoardColumnUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=80)
+    color: str | None = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
+    system_status: str | None = Field(
+        default=None,
+        pattern="^(backlog|todo|in_progress|review|testing|done)$",
+    )
+
+
+class BoardColumnRead(ORMModel):
+    id: int
+    name: str
+    color: str
+    position: int
+    system_status: str | None
+
+
+class BoardRead(BaseModel):
+    id: int
+    project_id: int
+    framework: str
+    columns: list[BoardColumnRead]
+    task_positions: dict[int, dict[str, int]]
+
+
+class ColumnReorder(BaseModel):
+    column_ids: list[int] = Field(min_length=1)
+
+
+class TaskMove(BaseModel):
+    column_id: int
+    position: int = Field(default=0, ge=0)

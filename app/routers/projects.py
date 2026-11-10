@@ -1,0 +1,319 @@
+from datetime import date
+
+from fastapi import APIRouter, HTTPException
+from sqlalchemy import delete, select
+
+from app.dependencies import (
+    CurrentUser,
+    DB,
+    require_project_admin,
+    require_workspace_admin,
+    require_workspace_member,
+)
+from app.models import Project, ProjectBoard, Sprint, Task, TaskAssignee, TaskStatus, TeamMember, User, Workspace, WorkspaceMember, WorkspaceRole
+from app.schemas import (
+    ProjectCreate,
+    ProjectRead,
+    ProjectUpdate,
+    SprintCreate,
+    SprintRead,
+    SprintUpdate,
+)
+
+router = APIRouter(tags=["Projects"])
+
+
+def validate_project_manager(db: DB, workspace_id: int, user_id: int) -> None:
+    workspace = db.get(Workspace, workspace_id)
+    if workspace is None:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    global_admin = db.scalar(select(User.id).where(
+        User.id == user_id,
+        User.organization_id == workspace.organization_id,
+        User.is_system_admin.is_(True),
+        User.is_active.is_(True),
+    ))
+    if global_admin is not None:
+        return
+    manager = db.scalar(select(WorkspaceMember).where(
+        WorkspaceMember.workspace_id == workspace_id,
+        WorkspaceMember.user_id == user_id,
+        WorkspaceMember.role == WorkspaceRole.admin,
+        WorkspaceMember.is_active.is_(True),
+    ))
+    if manager is None:
+        raise HTTPException(status_code=400, detail="Project admin must be an active administrator")
+
+
+def accessible_project(db: DB, project_id: int, user_id: int) -> Project:
+    project = db.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    membership = require_workspace_member(db, project.workspace_id, user_id)
+    if membership.role != WorkspaceRole.admin and project.project_manager_id != user_id:
+        allocation = db.scalar(select(TeamMember.id).where(
+            TeamMember.project_id == project.id,
+            TeamMember.user_id == user_id,
+        ))
+        task_assignment = db.scalar(select(TaskAssignee.id).join(Task).where(
+            Task.project_id == project.id,
+            TaskAssignee.user_id == user_id,
+        ))
+        if allocation is None and task_assignment is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+    return project
+
+
+def require_scrum_board(db: DB, project: Project) -> ProjectBoard:
+    board = db.scalar(
+        select(ProjectBoard).where(ProjectBoard.project_id == project.id)
+    )
+    if board is None or board.framework != "scrum":
+        raise HTTPException(
+            status_code=409,
+            detail="Sprints are available only for Scrum projects",
+        )
+    return board
+
+
+@router.post(
+    "/workspaces/{workspace_id}/projects",
+    response_model=ProjectRead,
+    status_code=201,
+)
+def create_project(
+    workspace_id: int,
+    payload: ProjectCreate,
+    db: DB,
+    current_user: CurrentUser,
+) -> Project:
+    require_workspace_admin(db, workspace_id, current_user.id)
+    values = payload.model_dump()
+    values["deadline"] = values["end_date"]
+    values["project_manager_id"] = values.get("project_manager_id") or current_user.id
+    validate_project_manager(db, workspace_id, values["project_manager_id"])
+    project = Project(workspace_id=workspace_id, **values)
+    db.add(project)
+    db.commit()
+    db.refresh(project)
+    return project
+
+
+@router.get(
+    "/workspaces/{workspace_id}/projects", response_model=list[ProjectRead]
+)
+def list_projects(
+    workspace_id: int, db: DB, current_user: CurrentUser
+) -> list[Project]:
+    membership = require_workspace_member(db, workspace_id, current_user.id)
+    query = select(Project).where(Project.workspace_id == workspace_id)
+    if membership.role != WorkspaceRole.admin:
+        allocated_project_ids = select(TeamMember.project_id).where(
+            TeamMember.user_id == current_user.id
+        )
+        task_project_ids = select(Task.project_id).join(TaskAssignee).where(
+            TaskAssignee.user_id == current_user.id
+        )
+        query = query.where(
+            (Project.project_manager_id == current_user.id) |
+            Project.id.in_(allocated_project_ids) |
+            Project.id.in_(task_project_ids)
+        )
+    return list(db.scalars(query.order_by(Project.created_at.desc())).all())
+
+
+@router.get("/projects/{project_id}", response_model=ProjectRead)
+def get_project(project_id: int, db: DB, current_user: CurrentUser) -> Project:
+    return accessible_project(db, project_id, current_user.id)
+
+
+@router.get("/projects/{project_id}/report")
+def project_report(project_id: int, db: DB, current_user: CurrentUser) -> dict:
+    """Shared read-only delivery report for project admins and allocated members."""
+    project = accessible_project(db, project_id, current_user.id)
+    tasks = list(db.scalars(select(Task).where(Task.project_id == project.id)).all())
+    allocations = list(db.scalars(select(TeamMember).where(TeamMember.project_id == project.id)).all())
+    task_assignee_ids = set(db.scalars(
+        select(TaskAssignee.user_id).join(Task).where(Task.project_id == project.id)
+    ).all())
+    today = date.today()
+    total = len(tasks)
+    completed = sum(task.status == TaskStatus.done for task in tasks)
+    progress = round(sum(task.progress for task in tasks) / total) if total else 0
+    overdue = [task for task in tasks if task.due_date and task.due_date < today and task.status != TaskStatus.done]
+    scheduled = [task for task in tasks if task.start_date and task.due_date]
+    status_counts = {status.value: sum(task.status == status for task in tasks) for status in TaskStatus}
+    priority_counts = {priority: sum(task.priority.value == priority for task in tasks) for priority in ("low", "medium", "high", "critical")}
+    total_points = sum(task.story_points or 0 for task in tasks)
+    completed_points = sum(task.story_points or 0 for task in tasks if task.status == TaskStatus.done)
+    task_planned_cost = sum(task.planned_budget or 0 for task in tasks)
+    actual_cost = sum(task.actual_cost or 0 for task in tasks)
+    costed_tasks = sum(task.actual_cost is not None for task in tasks)
+
+    # There are no task-dependency fields in the current data model. This is a
+    # transparent schedule-risk path: unfinished high-priority tasks, ordered by
+    # their planned end date, rather than a fabricated dependency calculation.
+    critical_path = sorted(
+        (task for task in scheduled if task.status != TaskStatus.done and task.priority.value in {"high", "critical"}),
+        key=lambda task: (task.due_date, task.start_date),
+    )[:8]
+    team_members = sorted({allocation.user_id for allocation in allocations} | task_assignee_ids)
+    planned_days = max(1, (project.end_date - project.start_date).days + 1)
+    elapsed_days = min(planned_days, max(0, (today - project.start_date).days + 1))
+    schedule_percent = round(elapsed_days * 100 / planned_days)
+    health = "On track"
+    if overdue or (schedule_percent > progress + 15 and total):
+        health = "At risk"
+    if project.end_date < today and completed < total:
+        health = "Delayed"
+    return {
+        "project": {"id": project.id, "name": project.name, "status": project.status.value, "priority": project.priority.value, "start_date": project.start_date, "end_date": project.end_date, "budget": project.budget},
+        "health": health,
+        "progress": progress,
+        "schedule_percent": schedule_percent,
+        "tasks": {"total": total, "completed": completed, "overdue": len(overdue), "scheduled": len(scheduled), "status_counts": status_counts, "priority_counts": priority_counts},
+        "budget": {"planned": project.budget, "task_planned": task_planned_cost, "actual": actual_cost, "variance": (project.budget - actual_cost) if project.budget is not None and costed_tasks else None, "costed_tasks": costed_tasks, "cost_tracking_available": bool(costed_tasks), "story_points": total_points, "completed_story_points": completed_points},
+        "team": {"allocated_members": len(team_members), "allocations": len(allocations)},
+        "critical_path": [{"id": task.id, "title": task.title, "priority": task.priority.value, "status": task.status.value, "start_date": task.start_date, "due_date": task.due_date, "progress": task.progress} for task in critical_path],
+        "workflow": status_counts,
+    }
+
+
+@router.patch("/projects/{project_id}", response_model=ProjectRead)
+def update_project(
+    project_id: int,
+    payload: ProjectUpdate,
+    db: DB,
+    current_user: CurrentUser,
+) -> Project:
+    project = accessible_project(db, project_id, current_user.id)
+    require_project_admin(db, project.id, current_user.id)
+    values = payload.model_dump(exclude_unset=True)
+    next_start = values.get("start_date", project.start_date)
+    next_end = values.get("end_date", project.end_date)
+    if next_start is None or next_end is None:
+        raise HTTPException(status_code=400, detail="Project start and end dates are required")
+    if next_end < next_start:
+        raise HTTPException(status_code=400, detail="Project end date must be on or after its start date")
+    dated_tasks = db.scalars(select(Task).where(Task.project_id == project.id)).all()
+    dated_sprints = db.scalars(select(Sprint).where(Sprint.project_id == project.id)).all()
+    if any(
+        (task.start_date and task.start_date < next_start) or
+        (task.due_date and task.due_date > next_end) or
+        (task.start_at and task.start_at.date() < next_start) or
+        (task.end_at and task.end_at.date() > next_end)
+        for task in dated_tasks
+    ) or any(
+        (sprint.start_date and sprint.start_date < next_start) or
+        (sprint.end_date and sprint.end_date > next_end)
+        for sprint in dated_sprints
+    ):
+        raise HTTPException(status_code=409, detail="Project dates must include all existing task and sprint dates")
+    if "end_date" in values:
+        values["deadline"] = values["end_date"]
+    if "project_manager_id" in values:
+        if values["project_manager_id"] is None:
+            raise HTTPException(status_code=400, detail="Every project requires a project admin")
+        validate_project_manager(db, project.workspace_id, values["project_manager_id"])
+    for field, value in values.items():
+        setattr(project, field, value)
+    db.commit()
+    db.refresh(project)
+    return project
+
+
+@router.delete("/projects/{project_id}", status_code=204)
+def delete_project(
+    project_id: int,
+    db: DB,
+    current_user: CurrentUser,
+) -> None:
+    project = accessible_project(db, project_id, current_user.id)
+    require_project_admin(db, project.id, current_user.id)
+    # Let database foreign-key cascades remove dependent data in one operation.
+    # This avoids loading every task, sprint, comment, and board row into Python
+    # before a project can be deleted.
+    db.execute(delete(Project).where(Project.id == project.id))
+    db.commit()
+
+
+@router.post(
+    "/projects/{project_id}/sprints",
+    response_model=SprintRead,
+    status_code=201,
+)
+def create_sprint(
+    project_id: int,
+    payload: SprintCreate,
+    db: DB,
+    current_user: CurrentUser,
+) -> Sprint:
+    project = accessible_project(db, project_id, current_user.id)
+    require_project_admin(db, project.id, current_user.id)
+    require_scrum_board(db, project)
+    if ((payload.start_date and payload.start_date < project.start_date) or
+        (payload.end_date and payload.end_date > project.end_date)):
+        raise HTTPException(status_code=400, detail="Sprint dates must be within the project dates")
+    if payload.is_active:
+        for current in db.scalars(
+            select(Sprint).where(
+                Sprint.project_id == project_id,
+                Sprint.is_active.is_(True),
+            )
+        ).all():
+            current.is_active = False
+    sprint = Sprint(project_id=project_id, **payload.model_dump())
+    db.add(sprint)
+    db.commit()
+    db.refresh(sprint)
+    return sprint
+
+
+@router.get("/projects/{project_id}/sprints", response_model=list[SprintRead])
+def list_sprints(
+    project_id: int, db: DB, current_user: CurrentUser
+) -> list[Sprint]:
+    project = accessible_project(db, project_id, current_user.id)
+    require_scrum_board(db, project)
+    return list(
+        db.scalars(
+            select(Sprint)
+            .where(Sprint.project_id == project_id)
+            .order_by(Sprint.created_at.desc())
+        ).all()
+    )
+
+
+@router.patch("/sprints/{sprint_id}", response_model=SprintRead)
+def update_sprint(
+    sprint_id: int,
+    payload: SprintUpdate,
+    db: DB,
+    current_user: CurrentUser,
+) -> Sprint:
+    sprint = db.get(Sprint, sprint_id)
+    if sprint is None:
+        raise HTTPException(status_code=404, detail="Sprint not found")
+    project = accessible_project(db, sprint.project_id, current_user.id)
+    require_project_admin(db, project.id, current_user.id)
+    require_scrum_board(db, project)
+    values = payload.model_dump(exclude_unset=True)
+    next_start = values.get("start_date", sprint.start_date)
+    next_end = values.get("end_date", sprint.end_date)
+    if ((next_start and next_start < project.start_date) or
+        (next_end and next_end > project.end_date)):
+        raise HTTPException(status_code=400, detail="Sprint dates must be within the project dates")
+    if values.get("is_active"):
+        for current in db.scalars(
+            select(Sprint).where(
+                Sprint.project_id == project.id,
+                Sprint.id != sprint.id,
+                Sprint.is_active.is_(True),
+            )
+        ).all():
+            current.is_active = False
+    for field, value in values.items():
+        setattr(sprint, field, value)
+    db.commit()
+    db.refresh(sprint)
+    return sprint
